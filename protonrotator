@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROTON="$(command -v protonvpn 2>/dev/null || true)"
+[ -n "$PROTON" ] || { echo "error: protonvpn not found" >&2; exit 127; }
+
+usage() {
+cat <<'USAGE'
+ProtonRotatoR - rotate ProtonVPN exit targets (graceful disconnect on exit)
+
+  protonrotator [OPTIONS]
+
+SELECTION
+  --mode region|country|city
+      region  (default) : random country from --region allowlist (minus exclusions)
+      country           : connect to --country (no randomisation)
+      city              : connect to --country + --city (if supported by your Proton CLI)
+
+  --region africa|americas|europe|asia|oceania|world
+      Used when --mode=region (default: world)
+
+  --country CODE
+      Two-letter code (AU, US, etc). Overrides region selection.
+
+  --city NAME
+      City name (only applied if supported by your Proton CLI; script checks `protonvpn connect --help`)
+      If --mode=city and --city is omitted, a random city is chosen from `protonvpn cities --country`.
+
+EXCLUSIONS
+  --exclude "CODES"
+      Exclude countries from selection. Accepts space OR comma separated lists:
+        --exclude "US UK RU"
+        --exclude "US,UK,RU"
+        --exclude US,UK RU
+
+ROTATION CONTROL
+  --once
+      Pick/connect once and exit (default)
+
+  --interval DURATION
+      Keep running and rotate every DURATION.
+      If DURATION is a plain integer (e.g. 15), it is treated as MINUTES.
+      Duration formats:
+        15         (minutes)
+        900s       (seconds)
+        15m        (minutes)
+        2h         (hours)
+        1h30m      (combined)
+        45s
+
+  --jitter JITTER
+      Add randomness to the interval sleep.
+      JITTER can be:
+        - Percent: 10%     (adds +/- 10% of the interval)
+        - Duration: 90s    (adds +/- 90 seconds)
+        - Duration: 5m     (adds +/- 5 minutes)
+
+SHUTDOWN BEHAVIOR
+  --on-exit leave|disconnect
+      leave                : stop rotating and leave the current VPN connection up
+      disconnect (default) : run `protonvpn disconnect` on shutdown
+
+STATE / BEHAVIOUR
+  --state-file PATH
+      Store last-used country (default: /tmp/protonvpn-last-country)
+  --no-avoid-repeat
+      Allow picking the same country twice in a row
+
+OUTPUT
+  -n, --dry-run     Show what would run, do nothing
+  -v, --verbose     Extra logs
+  -h, --help        Show help
+USAGE
+}
+
+# -------- Region lists as plain strings (no arrays) --------
+AFRICA="DZ AO CM TD KM CI EG ER ET GH GN KE LY MR MU MA MZ NG RW SN SO ZA SS SD TN TG TZ UG"
+AMERICAS="AR BS BB BZ BO BR CA CL CO CR CU DO EC SV GT HN JM MX NI PA PE PR PY TT US UY VE"
+EUROPE="AL AD AM AT AZ BA BE BG BY CH CY CZ DE DK EE ES FI FR GE GR HR HU IE IS IT LT LU LV MD ME MK MT NL NO PL PT RO RS RU SE SI SK TR UA UK GB"
+ASIA="AE AF BH BD BN BT CN HK ID IL IN IQ IR JO JP KG KH KP KR KW KZ LA LB LK MM MN MO MV MY NP OM PH PK PS QA SA SG SY TH TJ TM TW UZ VN YE"
+OCEANIA="AU FJ FM KI MH NC NF NR NZ PG PW SB TO TV VU WS"
+
+MODE="region"
+REGION="world"
+COUNTRY=""
+CITY=""
+STATE_FILE="/tmp/protonvpn-last-country"
+STATE_FILE_CITY=""
+AVOID_REPEAT=1
+DRY_RUN=0
+VERBOSE=0
+EXCLUDE_RAW=""
+RUN_ONCE=1
+INTERVAL_RAW=""
+INTERVAL_SECS=0
+JITTER_RAW=""
+JITTER_SECS=0
+JITTER_PCT=0
+ON_EXIT="disconnect"
+
+# used for graceful shutdown logs
+SHUTTING_DOWN=0
+
+log() { [ "$VERBOSE" -eq 1 ] && echo "$*" >&2 || true; }
+die() { echo "error: $*" >&2; exit 1; }
+
+graceful_exit() {
+  local reason="${1:-exit}"
+  # prevent re-entrancy
+  [ "$SHUTTING_DOWN" -eq 1 ] && exit 0
+  SHUTTING_DOWN=1
+
+  echo "[rotate] shutting down (${reason}). on-exit=${ON_EXIT}"
+
+  if [ "$ON_EXIT" = "disconnect" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "[dry-run] $PROTON disconnect"
+    else
+      # Best-effort; do not fail shutdown if this errors
+      "$PROTON" disconnect >/dev/null 2>&1 || true
+    fi
+  fi
+
+  exit 0
+}
+
+# Catch Ctrl+C/systemd stop and normal exits
+trap 'graceful_exit signal' INT TERM HUP
+trap 'graceful_exit exit' EXIT
+
+parse_duration_seconds() {
+  local in="${1:-}"
+  in="${in// /}"
+  [ -n "$in" ] || die "empty duration"
+
+  # Plain integer => minutes
+  if [[ "$in" =~ ^[0-9]+$ ]]; then
+    echo $(( in * 60 ))
+    return
+  fi
+
+  if [[ ! "$in" =~ ^[0-9smh]+$ ]]; then
+    die "invalid duration '$1' (use 15, 15m, 900s, 2h, 1h30m)"
+  fi
+
+  local total=0 rest="$in" n unit
+  while [[ -n "$rest" ]]; do
+    if [[ "$rest" =~ ^([0-9]+)([smh])(.*)$ ]]; then
+      n="${BASH_REMATCH[1]}"
+      unit="${BASH_REMATCH[2]}"
+      rest="${BASH_REMATCH[3]}"
+      case "$unit" in
+        s) total=$((total + n));;
+        m) total=$((total + n*60));;
+        h) total=$((total + n*3600));;
+      esac
+    else
+      die "invalid duration '$1' (use 15, 15m, 900s, 2h, 1h30m)"
+    fi
+  done
+  [ "$total" -gt 0 ] || die "duration must be > 0"
+  echo "$total"
+}
+
+parse_jitter() {
+  local j="${1:-}"
+  j="${j// /}"
+  [ -n "$j" ] || { JITTER_PCT=0; JITTER_SECS=0; return; }
+
+  if [[ "$j" =~ ^([0-9]+)%$ ]]; then
+    JITTER_PCT="${BASH_REMATCH[1]}"
+    JITTER_SECS=0
+    return
+  fi
+
+  JITTER_SECS="$(parse_duration_seconds "$j")"
+  JITTER_PCT=0
+}
+
+compute_sleep() {
+  local base="$1"
+  local delta=0
+
+  if [ "$JITTER_PCT" -gt 0 ]; then
+    delta=$(( base * JITTER_PCT / 100 ))
+  elif [ "$JITTER_SECS" -gt 0 ]; then
+    delta="$JITTER_SECS"
+  else
+    echo "$base"
+    return
+  fi
+
+  local span=$((delta * 2 + 1))
+  local r=$(( RANDOM % span ))
+  local offset=$(( r - delta ))
+  local sleep_secs=$(( base + offset ))
+  [ "$sleep_secs" -lt 5 ] && sleep_secs=5
+  echo "$sleep_secs"
+}
+
+# ---- args ----
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode) MODE="${2:-}"; shift 2;;
+    --region) REGION="${2:-}"; shift 2;;
+    --country) COUNTRY="${2:-}"; shift 2;;
+    --city) CITY="${2:-}"; shift 2;;
+    --exclude) EXCLUDE_RAW="${2:-}"; shift 2;;
+    --state-file) STATE_FILE="${2:-}"; shift 2;;
+    --no-avoid-repeat) AVOID_REPEAT=0; shift 1;;
+    --once) RUN_ONCE=1; INTERVAL_RAW=""; shift 1;;
+    --interval) RUN_ONCE=0; INTERVAL_RAW="${2:-}"; shift 2;;
+    --jitter) JITTER_RAW="${2:-}"; shift 2;;
+    --on-exit) ON_EXIT="${2:-}"; shift 2;;
+    -n|--dry-run) DRY_RUN=1; shift 1;;
+    -v|--verbose) VERBOSE=1; shift 1;;
+    -h|--help) usage; exit 0;;
+    *) die "unknown option: $1";;
+  esac
+done
+
+case "$ON_EXIT" in
+  leave|disconnect) ;;
+  *) die "--on-exit must be leave or disconnect" ;;
+esac
+
+MODE="$(printf "%s" "$MODE" | tr 'A-Z' 'a-z')"
+REGION="$(printf "%s" "$REGION" | tr 'A-Z' 'a-z')"
+COUNTRY="$(printf "%s" "$COUNTRY" | tr 'a-z' 'A-Z')"
+STATE_FILE_CITY="${STATE_FILE}.city"
+
+if [ "$RUN_ONCE" -eq 0 ]; then
+  [ -n "$INTERVAL_RAW" ] || die "--interval requires a duration (e.g. 15, 15m)"
+  INTERVAL_SECS="$(parse_duration_seconds "$INTERVAL_RAW")"
+  parse_jitter "$JITTER_RAW"
+fi
+
+# ---- exclusions -> newline list ----
+EXC_NL="$(printf "%s" "$EXCLUDE_RAW" | tr ',\t' '  ' | tr 'a-z' 'A-Z' | tr ' ' '\n' | sed '/^$/d' | grep -E '^[A-Z]{2}$' || true)"
+
+is_excluded() {
+  local c="$1"
+  [ -z "$EXC_NL" ] && return 1
+  printf "%s\n" "$EXC_NL" | grep -qx "$c"
+}
+
+# ---- available Proton country codes ----
+AVAILABLE_NL="$("$PROTON" countries 2>/dev/null | awk 'NF>=2 {print $NF}' | grep -E '^[A-Z]{2}$' | sort -u)"
+
+have_code() {
+  local c="$1"
+  printf "%s\n" "$AVAILABLE_NL" | grep -qx "$c"
+}
+
+region_base_nl() {
+  case "$REGION" in
+    africa) printf "%s\n" $AFRICA ;;
+    americas|america) printf "%s\n" $AMERICAS ;;
+    europe|eu) printf "%s\n" $EUROPE ;;
+    asia) printf "%s\n" $ASIA ;;
+    oceania|oc) printf "%s\n" $OCEANIA ;;
+    world|all|"") printf "%s\n" "$AVAILABLE_NL" ;;
+    *) die "unknown region '$REGION'" ;;
+  esac
+}
+
+build_candidates_nl() {
+  local base
+  base="$(region_base_nl)"
+  printf "%s\n" "$base" | while IFS= read -r c; do
+    c="$(printf "%s" "$c" | tr 'a-z' 'A-Z')"
+    [ -n "$c" ] || continue
+    have_code "$c" || continue
+    is_excluded "$c" && continue
+    printf "%s\n" "$c"
+  done
+}
+
+CAND_NL="$(build_candidates_nl | sort -u)"
+if [ -n "$COUNTRY" ]; then
+  have_code "$COUNTRY" || die "country '$COUNTRY' not available"
+  is_excluded "$COUNTRY" && die "country '$COUNTRY' is excluded"
+  CAND_NL="$COUNTRY"
+fi
+[ -n "$CAND_NL" ] || die "no valid countries after filtering"
+
+read_last() {
+  [ -r "$STATE_FILE" ] || { echo ""; return; }
+  cat "$STATE_FILE" 2>/dev/null | tr 'a-z' 'A-Z' || true
+}
+write_last() {
+  local v="$1"
+  printf "%s\n" "$v" > "$STATE_FILE" 2>/dev/null || true
+}
+
+read_last_city() {
+  [ -r "$STATE_FILE_CITY" ] || { echo ""; return; }
+  cat "$STATE_FILE_CITY" 2>/dev/null || true
+}
+write_last_city() {
+  local v="$1"
+  printf "%s\n" "$v" > "$STATE_FILE_CITY" 2>/dev/null || true
+}
+
+pick_country() {
+  local n picked last
+  n="$(printf "%s\n" "$CAND_NL" | wc -l | tr -d ' ')"
+  [ "$n" -ge 1 ] || die "no candidates"
+  if [ "$n" -eq 1 ]; then
+    printf "%s\n" "$CAND_NL"; return
+  fi
+
+  last="$(read_last)"
+  while :; do
+    picked="$(printf "%s\n" "$CAND_NL" | awk 'BEGIN{srand()} {a[NR]=$0} END{print a[int(1+rand()*NR)]}')"
+    if [ "$AVOID_REPEAT" -eq 1 ] && [ -n "$last" ] && [ "$picked" = "$last" ]; then
+      continue
+    fi
+    printf "%s\n" "$picked"; return
+  done
+}
+
+cities_for_country() {
+  local c="$1"
+  "$PROTON" cities --country "$c" 2>/dev/null \
+    | awk -F '  +' 'NR>2 {print $1}' \
+    | sed '/^$/d'
+}
+
+pick_city() {
+  local country="$1" cities_nl="$2" n picked last last_country last_city
+  n="$(printf "%s\n" "$cities_nl" | wc -l | tr -d ' ')"
+  [ "$n" -ge 1 ] || return 1
+  if [ "$n" -eq 1 ]; then
+    picked="$(printf "%s\n" "$cities_nl")"
+    write_last_city "${country}:${picked}"
+    printf "%s\n" "$picked"
+    return 0
+  fi
+
+  last="$(read_last_city)"
+  last_country="${last%%:*}"
+  last_city=""
+  if [ "$last" != "$last_country" ]; then
+    last_city="${last#*:}"
+  fi
+
+  while :; do
+    picked="$(printf "%s\n" "$cities_nl" | awk 'BEGIN{srand()} {a[NR]=$0} END{print a[int(1+rand()*NR)]}')"
+    if [ "$AVOID_REPEAT" -eq 1 ] && [ "$last_country" = "$country" ] && [ -n "$last_city" ] && [ "$picked" = "$last_city" ]; then
+      continue
+    fi
+    write_last_city "${country}:${picked}"
+    printf "%s\n" "$picked"
+    return 0
+  done
+}
+
+do_rotate_once() {
+  local picked picked_city city_effective connect_help args cities_nl
+  picked="$(pick_country)"
+  write_last "$picked"
+
+  connect_help="$("$PROTON" connect --help 2>/dev/null || true)"
+  args="connect"
+
+  case "$MODE" in
+    region|country) args="$args --country $picked" ;;
+    city)
+      [ -n "$COUNTRY" ] || die "--mode city requires --country"
+      args="$args --country $COUNTRY"
+      if [ -z "$CITY" ]; then
+        cities_nl="$(cities_for_country "$COUNTRY" || true)"
+        if [ -n "$cities_nl" ]; then
+          picked_city="$(pick_city "$COUNTRY" "$cities_nl" || true)"
+        fi
+      fi
+      ;;
+    *) die "unknown mode '$MODE'" ;;
+  esac
+
+  city_effective="$CITY"
+  if [ -n "${picked_city:-}" ]; then
+    city_effective="$picked_city"
+  fi
+
+  if [ -n "$city_effective" ] && printf "%s\n" "$connect_help" | grep -q -- '--city'; then
+    args="$args --city $(printf "%s" "$city_effective" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"
+  fi
+
+  if [ -n "$city_effective" ]; then
+    echo "[rotate] mode=$MODE region=$REGION picked=$picked city=$city_effective exclude=${EXCLUDE_RAW:-<none>}"
+  else
+    echo "[rotate] mode=$MODE region=$REGION picked=$picked exclude=${EXCLUDE_RAW:-<none>}"
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "[dry-run] $PROTON $args"
+    return 0
+  fi
+
+  # shellcheck disable=SC2086
+  "$PROTON" $args
+}
+
+if [ "$RUN_ONCE" -eq 1 ]; then
+  do_rotate_once
+  exit 0
+fi
+
+log "[daemon] base interval=${INTERVAL_SECS}s jitter=${JITTER_RAW:-0} on-exit=${ON_EXIT}"
+while :; do
+  do_rotate_once || log "[daemon] rotate failed; retry next interval"
+  sleep_secs="$(compute_sleep "$INTERVAL_SECS")"
+  log "[daemon] sleeping ${sleep_secs}s"
+  sleep "$sleep_secs" &
+  wait $! || true
+done
